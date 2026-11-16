@@ -46,6 +46,15 @@ function peeledTarget(store: Store, repo: Repo, oid: string): string | undefined
 
 /** The v0 ref advertisement: service preamble, refs with capabilities on the first line, flush. */
 function advertisementV0(store: Store, repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const cacheKey = `${repo.fullName}|adv|${service}`;
+  const cached = store.cachedAdvertisement(cacheKey);
+  if (cached !== undefined) return cached;
+  const built = buildAdvertisementV0(store, repo, service);
+  store.cacheAdvertisement(cacheKey, built);
+  return built;
+}
+
+function buildAdvertisementV0(store: Store, repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const headRef = `refs/heads/${repo.defaultBranch}`;
   const caps =
     service === 'git-upload-pack'
@@ -74,15 +83,18 @@ function advertisementV0(store: Store, repo: Repo, service: 'git-upload-pack' | 
 
 /** The v2 capability advertisement: `version 2`, capability lines, flush. No service header. */
 function advertisementV2(): Buffer {
-  return encodePktLines([
-    'version 2\n',
-    'ls-refs=unborn\n',
-    'fetch=shallow\n',
-    'object-format=sha1\n',
-    `agent=${AGENT}\n`,
-    'flush',
-  ]);
+  return ADVERTISEMENT_V2;
 }
+
+/** The v2 advertisement never varies, so it is built once and shared by every response. */
+const ADVERTISEMENT_V2: Buffer = encodePktLines([
+  'version 2\n',
+  'ls-refs=unborn\n',
+  'fetch=shallow\n',
+  'object-format=sha1\n',
+  `agent=${AGENT}\n`,
+  'flush',
+]);
 
 /**
  * GET /info/refs. Upload-pack answers v2 when the client asks with Git-Protocol: version=2 and
@@ -107,15 +119,28 @@ export function gitInfoRefs(
 
 /** Wrap bytes in side-band-64k packets (band byte + chunk, pkt-lined), plus a trailing flush. */
 function sidebandWrap(data: Buffer, band: 1 | 2 = 1): Buffer {
-  const parts: Buffer[] = [];
   const CHUNK = 65515;
-  for (let offset = 0; offset < data.length; offset += CHUNK) {
-    const chunk = data.subarray(offset, Math.min(offset + CHUNK, data.length));
-    parts.push(encodePktLine(Buffer.concat([Buffer.from([band]), chunk])));
+  const packets = data.length === 0 ? 1 : Math.ceil(data.length / CHUNK);
+  const total = packets * 5 + data.length + 4;
+  const out = Buffer.allocUnsafe(total);
+  let at = 0;
+  const writePacket = (chunk: Buffer): void => {
+    out.write((chunk.length + 5).toString(16).padStart(4, '0'), at, 4, 'ascii');
+    at += 4;
+    out[at] = band;
+    at += 1;
+    chunk.copy(out, at);
+    at += chunk.length;
+  };
+  if (data.length === 0) {
+    writePacket(Buffer.alloc(0));
+  } else {
+    for (let offset = 0; offset < data.length; offset += CHUNK) {
+      writePacket(data.subarray(offset, Math.min(offset + CHUNK, data.length)));
+    }
   }
-  if (data.length === 0) parts.push(encodePktLine(Buffer.from([band])));
-  parts.push(Buffer.from('0000', 'ascii'));
-  return Buffer.concat(parts);
+  out.write('0000', at, 4, 'ascii');
+  return out;
 }
 
 // --------------------------------------------------------------------------- fetch planning
@@ -146,8 +171,8 @@ function generations(
       queue.push(peeled);
     }
   }
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  for (let head = 0; head < queue.length; head += 1) {
+    const oid = queue[head] as string;
     const depth = gen.get(oid) as number;
     const view = store.commitView(repo, oid);
     if (!view) continue;
@@ -333,6 +358,15 @@ interface LsRefsArgs {
 }
 
 function handleLsRefs(store: Store, repo: Repo, args: LsRefsArgs): Buffer {
+  const cacheKey = `${repo.fullName}|lsrefs|${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}|${JSON.stringify(args.prefixes)}`;
+  const cached = store.cachedLsRefs(cacheKey);
+  if (cached !== undefined) return cached;
+  const built = buildLsRefs(store, repo, args);
+  store.cacheLsRefs(cacheKey, built);
+  return built;
+}
+
+function buildLsRefs(store: Store, repo: Repo, args: LsRefsArgs): Buffer {
   const headRef = `refs/heads/${repo.defaultBranch}`;
   const refs = store.listRefs(repo);
   const lines: string[] = [];
@@ -582,7 +616,7 @@ export function gitReceivePack(store: Store, repo: Repo, body: Buffer): GitRespo
     }
     if (packObjects !== null) {
       unpackOk = true;
-      store.putObjects(repo, packObjects.values());
+      store.putObjectsMap(repo, packObjects);
       for (const command of commands) {
         const current = store.getRef(repo, command.ref);
         if (command.newOid === ZERO_OID) {

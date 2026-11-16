@@ -37,6 +37,21 @@ export interface RestReply {
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
+/** The one viewer object: every field is a scenario constant, so one frozen copy serves all. */
+const USER_OBJECT: Record<string, unknown> = Object.freeze({
+  login: VIEWER.login,
+  id: VIEWER.id,
+  name: VIEWER.name,
+  email: VIEWER.email,
+  type: 'User',
+  site_admin: false,
+  created_at: trialNowIso(),
+  updated_at: trialNowIso(),
+});
+
+/** Shared empty array for fields that are always empty (assignees, topics): stringify-only. */
+const EMPTY_ARRAY: readonly unknown[] = Object.freeze([]);
+
 function jsonReply(store: Store, status: number, value: unknown, extraHeaders: Record<string, string> = {}): RestReply {
   return {
     status,
@@ -54,16 +69,7 @@ function notFound(store: Store): RestReply {
 }
 
 function userObject(): Record<string, unknown> {
-  return {
-    login: VIEWER.login,
-    id: VIEWER.id,
-    name: VIEWER.name,
-    email: VIEWER.email,
-    type: 'User',
-    site_admin: false,
-    created_at: trialNowIso(),
-    updated_at: trialNowIso(),
-  };
+  return USER_OBJECT;
 }
 
 function labelObject(label: Label): Record<string, unknown> {
@@ -96,7 +102,7 @@ export function repoObject(store: Store, repo: Repo): Record<string, unknown> {
     watchers_count: 0,
     size: 0,
     language: null,
-    topics: [],
+    topics: EMPTY_ARRAY,
   };
 }
 
@@ -119,7 +125,7 @@ export function issueObject(store: Store, repo: Repo, item: Item): Record<string
     state: item.state,
     labels: item.labels.map(labelObject),
     user: userObject(),
-    assignees: [],
+    assignees: EMPTY_ARRAY,
     milestone: null,
     locked: false,
     comments: item.comments.length,

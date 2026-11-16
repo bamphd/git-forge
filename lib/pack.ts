@@ -26,35 +26,67 @@ export function encodePktLine(payload: string | Uint8Array): Buffer {
   if (data.length > PKT_LINE_MAX_PAYLOAD) {
     throw new Error(`pkt-line payload is ${data.length} bytes, over the ${PKT_LINE_MAX_PAYLOAD}-byte maximum`);
   }
-  const header = Buffer.allocUnsafe(4);
-  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([header, data]);
+  const out = Buffer.allocUnsafe(data.length + 4);
+  out.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  data.copy(out, 4);
+  return out;
 }
 
+const FLUSH_PACKET = Buffer.from('0000', 'ascii');
+const DELIM_PACKET = Buffer.from('0001', 'ascii');
+const RESPONSE_END_PACKET = Buffer.from('0002', 'ascii');
+
 export function pktLineFlush(): Buffer {
-  return Buffer.from('0000', 'ascii');
+  return FLUSH_PACKET;
 }
 
 export function pktLineDelim(): Buffer {
-  return Buffer.from('0001', 'ascii');
+  return DELIM_PACKET;
 }
 
 export function pktLineResponseEnd(): Buffer {
-  return Buffer.from('0002', 'ascii');
+  return RESPONSE_END_PACKET;
 }
 
 /** Encode a mixed sequence; 'flush'/'delim'/'response-end' are the control packets. */
 export function encodePktLines(
   items: ReadonlyArray<string | Uint8Array | 'flush' | 'delim' | 'response-end'>,
 ): Buffer {
-  const parts: Buffer[] = [];
+  const prepared: Array<{ readonly kind: 'data'; readonly data: Buffer } | { readonly kind: 'control'; readonly code: string }> = [];
+  let total = 0;
   for (const item of items) {
-    if (item === 'flush') parts.push(pktLineFlush());
-    else if (item === 'delim') parts.push(pktLineDelim());
-    else if (item === 'response-end') parts.push(pktLineResponseEnd());
-    else parts.push(encodePktLine(item));
+    if (item === 'flush') {
+      prepared.push({ kind: 'control', code: '0000' });
+      total += 4;
+    } else if (item === 'delim') {
+      prepared.push({ kind: 'control', code: '0001' });
+      total += 4;
+    } else if (item === 'response-end') {
+      prepared.push({ kind: 'control', code: '0002' });
+      total += 4;
+    } else {
+      const data = typeof item === 'string' ? Buffer.from(item, 'utf8') : asBuffer(item);
+      if (data.length > PKT_LINE_MAX_PAYLOAD) {
+        throw new Error(`pkt-line payload is ${data.length} bytes, over the ${PKT_LINE_MAX_PAYLOAD}-byte maximum`);
+      }
+      prepared.push({ kind: 'data', data });
+      total += data.length + 4;
+    }
   }
-  return Buffer.concat(parts);
+  const out = Buffer.allocUnsafe(total);
+  let at = 0;
+  for (const part of prepared) {
+    if (part.kind === 'control') {
+      out.write(part.code, at, 4, 'ascii');
+      at += 4;
+    } else {
+      out.write((part.data.length + 4).toString(16).padStart(4, '0'), at, 4, 'ascii');
+      at += 4;
+      part.data.copy(out, at);
+      at += part.data.length;
+    }
+  }
+  return out;
 }
 
 const HEX4 = /^[0-9a-fA-F]{4}$/;
@@ -400,23 +432,32 @@ function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
 
 /**
  * Build a packfile from plain objects (no deltas). The order is the caller's; git accepts any
- * order. The trailer is SHA-1 over everything before it.
+ * order. The trailer is SHA-1 over everything before it. One allocation: every entry is
+ * deflated first so the whole pack (header, entries, trailer) fits a single buffer.
  */
 export function writePack(objects: Iterable<{ readonly type: GitObjectType; readonly data: Uint8Array }>): Buffer {
-  const list = [...objects];
-  const parts: Buffer[] = [];
-  const header = Buffer.allocUnsafe(12);
-  header.write('PACK', 0, 4, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(list.length, 8);
-  parts.push(header);
-  for (const object of list) {
+  const entries: Array<{ readonly header: Buffer; readonly deflated: Buffer }> = [];
+  let total = 12 + 20;
+  for (const object of objects) {
     const data = asBuffer(object.data);
-    parts.push(writePackObjectHeader(object.type, data.length));
-    parts.push(deflateSync(data));
+    const header = writePackObjectHeader(object.type, data.length);
+    const deflated = deflateSync(data);
+    entries.push({ header, deflated });
+    total += header.length + deflated.length;
   }
-  const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  const out = Buffer.allocUnsafe(total);
+  out.write('PACK', 0, 4, 'ascii');
+  out.writeUInt32BE(2, 4);
+  out.writeUInt32BE(entries.length, 8);
+  let at = 12;
+  for (const entry of entries) {
+    entry.header.copy(out, at);
+    at += entry.header.length;
+    entry.deflated.copy(out, at);
+    at += entry.deflated.length;
+  }
+  createHash('sha1').update(out.subarray(0, at)).digest().copy(out, at);
+  return out;
 }
 
 /** SHA-1 of every pack byte before the 20-byte trailer. */

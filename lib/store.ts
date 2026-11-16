@@ -129,6 +129,10 @@ export interface Repo {
   pushedAt: string;
   readonly objects: Map<string, GitObject>;
   readonly refs: Map<string, string>;
+  /** Parsed commits, filled lazily: objects are immutable, so a parsed commit never goes stale. */
+  readonly commitViews: Map<string, CommitView>;
+  /** Parsed trees, filled lazily, immutable for the same reason. */
+  readonly treeCache: Map<string, TreeEntry[]>;
   readonly labels: Label[];
   readonly items: Item[];
   nextNumber: number;
@@ -163,17 +167,19 @@ export class Store {
   private readonly packCache = new Map<string, Buffer>();
   private readonly fetchCache = new Map<string, Buffer>();
   private readonly issueCache = new Map<string, Buffer>();
+  private readonly advCache = new Map<string, Buffer>();
+  private readonly lsRefsCache = new Map<string, Buffer>();
   private readonly repoById = new Map<number, Repo>();
   private readonly itemById = new Map<number, { repo: Repo; item: Item }>();
   private readonly commentById = new Map<number, { repo: Repo; item: Item; comment: Comment }>();
 
-  /** Mark a repository changed, invalidating its cached issue serializations. */
+  /**
+   * Mark a repository changed, invalidating its cached issue serializations. The version lives
+   * in every issue-cache key, so stale entries are unreachable without being deleted; the size
+   * cap in cacheIssueBody bounds the map. Bumping the counter is the whole invalidation.
+   */
   touch(repo: Repo): void {
     repo.version += 1;
-    const prefix = `${repo.fullName}|issue|`;
-    for (const key of this.issueCache.keys()) {
-      if (key.startsWith(prefix)) this.issueCache.delete(key);
-    }
   }
 
   /** A cached GET /issues/{n} body, or null when the repository changed since it was built. */
@@ -242,6 +248,8 @@ export class Store {
       pushedAt: NOW.iso,
       objects: new Map(),
       refs: new Map(),
+      commitViews: new Map(),
+      treeCache: new Map(),
       labels: [],
       items: [],
       nextNumber: 1,
@@ -287,6 +295,17 @@ export class Store {
   putObjects(repo: Repo, objects: Iterable<GitObject>): void {
     for (const object of objects) {
       const oid = hashObject(object.type, object.data);
+      if (!repo.objects.has(oid)) repo.objects.set(oid, object);
+    }
+    this.invalidatePackCache(repo);
+  }
+
+  /**
+   * Store objects already keyed by their ids (a pack reader's map): no rehashing, because the
+   * reader recomputed every id when it resolved the pack. Objects already present are kept.
+   */
+  putObjectsMap(repo: Repo, objects: Map<string, GitObject>): void {
+    for (const [oid, object] of objects) {
       if (!repo.objects.has(oid)) repo.objects.set(oid, object);
     }
     this.invalidatePackCache(repo);
@@ -352,10 +371,14 @@ export class Store {
   }
 
   commitView(repo: Repo, oid: string): CommitView | undefined {
+    const cached = repo.commitViews.get(oid);
+    if (cached !== undefined) return cached;
     const object = repo.objects.get(oid);
     if (!object || object.type !== 'commit') return undefined;
     try {
-      return parseCommit(object.data);
+      const view = parseCommit(object.data);
+      repo.commitViews.set(oid, view);
+      return view;
     } catch {
       return undefined;
     }
@@ -397,8 +420,8 @@ export class Store {
   mergeBase(repo: Repo, a: string, b: string): string | undefined {
     const ancestorsA = new Set<string>();
     const queueA = [a];
-    while (queueA.length > 0) {
-      const oid = queueA.shift() as string;
+    for (let head = 0; head < queueA.length; head += 1) {
+      const oid = queueA[head] as string;
       if (ancestorsA.has(oid)) continue;
       ancestorsA.add(oid);
       const view = this.commitView(repo, oid);
@@ -406,8 +429,8 @@ export class Store {
     }
     const seen = new Set<string>();
     const queueB = [b];
-    while (queueB.length > 0) {
-      const oid = queueB.shift() as string;
+    for (let head = 0; head < queueB.length; head += 1) {
+      const oid = queueB[head] as string;
       if (seen.has(oid)) continue;
       seen.add(oid);
       if (ancestorsA.has(oid)) return oid;
@@ -428,10 +451,14 @@ export class Store {
   // --------------------------------------------------------------------- trees
 
   treeEntries(repo: Repo, treeOid: string): TreeEntry[] {
+    const cached = repo.treeCache.get(treeOid);
+    if (cached !== undefined) return cached;
     const object = repo.objects.get(treeOid);
     if (!object || object.type !== 'tree') return [];
     try {
-      return parseTree(object.data);
+      const entries = parseTree(object.data);
+      repo.treeCache.set(treeOid, entries);
+      return entries;
     } catch {
       return [];
     }
@@ -715,13 +742,43 @@ export class Store {
     this.fetchCache.set(key, response);
   }
 
+  /** A cached ref advertisement for one repository and service, or undefined. */
+  cachedAdvertisement(key: string): Buffer | undefined {
+    return this.advCache.get(key);
+  }
+
+  cacheAdvertisement(key: string, body: Buffer): void {
+    if (this.advCache.size > 256) this.advCache.clear();
+    this.advCache.set(key, body);
+  }
+
+  /** A cached ls-refs response for one repository and argument shape, or undefined. */
+  cachedLsRefs(key: string): Buffer | undefined {
+    return this.lsRefsCache.get(key);
+  }
+
+  cacheLsRefs(key: string, body: Buffer): void {
+    if (this.lsRefsCache.size > 256) this.lsRefsCache.clear();
+    this.lsRefsCache.set(key, body);
+  }
+
   invalidatePackCache(repo: Repo): void {
     const prefix = `${repo.fullName}|`;
     for (const key of this.packCache.keys()) {
       if (key.startsWith(prefix)) this.packCache.delete(key);
     }
+    // Fetch responses are keyed `v2|<cacheKey>` / `v0|<cacheKey>`, so the repository prefix
+    // sits after the protocol tag; match all three shapes or stale fetches survive a push.
     for (const key of this.fetchCache.keys()) {
-      if (key.startsWith(prefix)) this.fetchCache.delete(key);
+      if (key.startsWith(prefix) || key.startsWith(`v2|${prefix}`) || key.startsWith(`v0|${prefix}`)) {
+        this.fetchCache.delete(key);
+      }
+    }
+    for (const key of this.advCache.keys()) {
+      if (key.startsWith(prefix)) this.advCache.delete(key);
+    }
+    for (const key of this.lsRefsCache.keys()) {
+      if (key.startsWith(prefix)) this.lsRefsCache.delete(key);
     }
   }
 }
